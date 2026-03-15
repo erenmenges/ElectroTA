@@ -1,0 +1,6 @@
+python-dotenv
+google-genai
+pyaudio
+websockets
+fastapi
+uvicorn

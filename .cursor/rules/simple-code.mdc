@@ -1,0 +1,5 @@
+---
+alwaysApply: true
+---
+
+Whenever you write code, make it very simple and minimal. Do not use any shortcuts, efficiency tricks, or niche function calls. Do not try to be smart. The code should be readable and comprehendable by human developers without any issue. However, if the feature/fix you need to implement absolutely requires you to write complex code, do it. If not, stick to writing readable, clean code.
