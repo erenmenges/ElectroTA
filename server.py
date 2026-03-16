@@ -1,4 +1,5 @@
 import os
+import sys
 import asyncio
 import struct
 import math
@@ -7,6 +8,7 @@ import base64
 import time
 import traceback
 import logging
+import tempfile
 from collections import deque
 
 from dotenv import load_dotenv
@@ -14,6 +16,10 @@ from google import genai
 from google.genai import types
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
+
+# Add breadboard_analysis to path so its internal imports resolve
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "breadboard_analysis"))
+from complete_analysis import run_analysis
 
 logging.basicConfig(level=logging.WARNING)
 load_dotenv()
@@ -29,12 +35,16 @@ model = "gemini-2.5-flash-native-audio-preview-12-2025"
 probe_declaration = {
     "name": "probe",
     "description": (
-        "Reads voltage and current measurements from the probe instrument. "
-        "Returns voltage (V) and current (A) readings. "
-        "\n**Invocation Condition:** ONLY UNMISTAKABLY call this function when the user "
-        "literally says the word 'probe'. Do NOT call it for theoretical "
-        "questions, calculations, or general discussion about voltages or "
-        "currents. The user must explicitly say 'probe' to trigger a reading."
+        "Reads voltage measurement from the probe instrument. "
+        "Returns voltage (V) reading. A null voltage means no reading is "
+        "available yet — this is normal and temporary, not an error. "
+        "\n**Invocation rules:**\n"
+        "1. You MUST UNMISTAKABLY call this function every single time the user says the word "
+        "'probe'. No exceptions, even if previous calls returned null.\n"
+        "2. Do NOT call it for theoretical questions, calculations, or general "
+        "discussion about voltages or currents.\n"
+        "3. Never refuse to call this function when the user says 'probe'. "
+        "Never substitute a verbal response for calling this function."
     ),
     "parameters": {
         "type": "object",
@@ -136,12 +146,18 @@ def build_config(detailed_analysis):
         "**Conversational Rules:**\n"
         "1. Help the student understand electronics concepts and guide them through "
         "building and debugging the target circuit above.\n"
-        "2. ONLY call the `probe` function when the student literally says the word "
-        "'probe'. Do NOT call it for theoretical questions, calculations, or general "
+        "2. You MUST call the `probe` function EVERY TIME the student says the word "
+        "'probe'. This is an absolute rule with NO EXCEPTIONS. Even if previous probe "
+        "calls returned null, you MUST still call probe() the next time the student "
+        "says 'probe'. Never refuse to call probe(). Never substitute a verbal response "
+        "for a probe call. If the student says 'probe', call the function — period.\n"
+        "3. Do NOT call probe() for theoretical questions, calculations, or general "
         "discussion about voltages or currents. If the student asks 'what is the voltage "
         "at X?' without saying 'probe', answer theoretically using circuit analysis.\n"
-        "3. After receiving probe results, read the voltage and current values "
-        "back to the student clearly.\n\n"
+        "4. After receiving probe results: if the voltage is a number, read it back "
+        "clearly. If the voltage is null, tell the student the probe did not pick up "
+        "a reading and suggest they check the physical connections, but do NOT refuse "
+        "to call probe() again if they ask.\n\n"
         "**Image Analysis Rules (CRITICAL):**\n"
         "When the student sends an image, follow these steps strictly:\n"
         "Step 1 — IDENTIFY: What is the image? Is it a photo of a breadboard/circuit, "
@@ -195,6 +211,16 @@ app = FastAPI()
 _session_lock = asyncio.Lock()
 
 
+def _log_task_exception(task):
+    """Done-callback for fire-and-forget tasks: log exceptions instead of silently dropping them."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        print(f"\n[Background task error: {exc}]")
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+
+
 class ConnectionRateLimiter:
     """Limits how many times a given IP can trigger the analysis pipeline."""
 
@@ -221,7 +247,10 @@ class ConnectionRateLimiter:
 
 
 # Allow at most 3 analysis-triggering connections per IP per 60 seconds
-_analysis_rate_limiter = ConnectionRateLimiter(max_calls=3, window_seconds=60)
+_analysis_rate_limiter = ConnectionRateLimiter(max_calls=100, window_seconds=60)
+
+# Global rate limit: cap total analysis calls regardless of IP (defense-in-depth)
+_global_rate_limiter = ConnectionRateLimiter(max_calls=100, window_seconds=60)
 
 
 def compute_rms(audio_bytes):
@@ -251,6 +280,9 @@ class SessionState:
         self.disconnected = asyncio.Event()
         self.last_image_time = 0.0
         self.image_count = 0
+        self.turn_produced_content = False
+        self.turn_was_interrupted = False
+        self.consecutive_empty_turns = 0
 
     def is_loud_enough(self, mic_rms):
         if self.is_playing:
@@ -356,33 +388,99 @@ async def process_audio(session, state, ws, audio_data):
 
 
 async def process_image(session, state, ws, image_data, mime_type):
-    """Send an image to Gemini as an interrupt with a silent audio nudge."""
-    print(f"\n[>>> Photo: sending {len(image_data)} bytes as interrupt]")
+    """Run CV pipeline on image and send analysis text to Gemini."""
+    print(f"\n[>>> Photo: running CV pipeline on {len(image_data)} bytes]")
 
-    if state.is_playing:
-        state.interrupt_requested = True
-        state.is_playing = False
-        await ws.send_json({"type": "interrupt"})
+    # Always interrupt client playback and any in-flight Gemini generation,
+    # even if no audio is currently playing. Gemini may be about to start
+    # a new turn from a recent activity_end.
+    state.interrupt_requested = True
+    state.is_playing = False
+    await ws.send_json({"type": "interrupt"})
 
-    SILENCE_DURATION_MS = 500
-    num_silence_bytes = int(INPUT_AUDIO_RATE * 2 * SILENCE_DURATION_MS / 1000)
-    silent_audio = b"\x00" * num_silence_bytes
+    # Inject a "hold" message with turn_complete=False so Gemini treats the
+    # user turn as still open and does not begin generating a response while
+    # the CV pipeline runs.
+    try:
+        await session.send_client_content(
+            turns=[
+                types.Content(
+                    role="user",
+                    parts=[types.Part(text=(
+                        "[System: The student just sent a photo. It is being analyzed by "
+                        "the computer vision pipeline. Do NOT respond until you receive "
+                        "the analysis results. Wait silently.]"
+                    ))],
+                ),
+            ],
+            turn_complete=False,
+        )
+        print("[>>> Hold message sent to Gemini — waiting for CV pipeline]")
+    except Exception as e:
+        print(f"[Hold message failed: {e}]")
 
-    await session.send_realtime_input(
-        activity_start=types.ActivityStart()
+    await ws.send_json({"type": "status", "message": "Analyzing image with CV pipeline..."})
+
+    # Save image to a temp file (run_analysis expects a file path)
+    ext = ".jpg" if "jpeg" in mime_type or "jpg" in mime_type else ".png"
+    tmp_file = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+    tmp_path = tmp_file.name
+    tmp_file.write(image_data)
+    tmp_file.close()
+
+    # detect_components.main() derives its crops dir as
+    #   os.path.join(os.path.dirname(output_path), "crops")
+    # and run_analysis sets output_path = crops_dir.parent / "segmented_output.png".
+    # So crops_dir MUST end with "/crops" for the paths to line up.
+    crops_tmp_parent = tempfile.mkdtemp(prefix="electro_crops_")
+    crops_tmp_dir = os.path.join(crops_tmp_parent, "crops")
+
+    try:
+        analysis_result = await asyncio.to_thread(run_analysis, tmp_path, crops_tmp_dir)
+    except Exception as e:
+        print(f"[CV pipeline error: {e}]")
+        traceback.print_exc()
+        analysis_result = f"CV pipeline encountered an error: {e}"
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        try:
+            import shutil
+            shutil.rmtree(crops_tmp_parent, ignore_errors=True)
+        except OSError:
+            pass
+
+    print(f"\n[CV pipeline result ({len(analysis_result)} chars)]:")
+    print(analysis_result)
+    print("[End of CV pipeline result]")
+
+    cv_message = (
+        "The student just sent an image of their breadboard circuit. "
+        "Our computer vision pipeline analyzed the image and returned the following "
+        "results. Use these results as the basis for your response — they describe "
+        "what is physically on the breadboard. Compare these findings against the "
+        "target circuit and help the student accordingly.\n\n"
+        f"{analysis_result}"
     )
-    await session.send_realtime_input(
-        video=types.Blob(data=image_data, mime_type=mime_type)
-    )
-    await session.send_realtime_input(
-        audio=types.Blob(data=silent_audio, mime_type="audio/pcm;rate=16000")
-    )
-    await session.send_realtime_input(
-        activity_end=types.ActivityEnd()
-    )
+
+    try:
+        await session.send_client_content(
+            turns=[
+                types.Content(
+                    role="user",
+                    parts=[types.Part(text=cv_message)],
+                ),
+            ],
+            turn_complete=True,
+        )
+    except Exception as e:
+        print(f"[CV pipeline: failed to send result to Gemini (session may be closed): {e}]")
+        return
 
     state.user_is_active = False
-    print("[>>> Photo sent — Gemini will respond]")
+    print("[>>> CV analysis sent to Gemini as text — Gemini will respond]")
 
 
 @app.websocket("/ws")
@@ -397,6 +495,16 @@ async def websocket_endpoint(ws: WebSocket):
         return
 
     client_ip = ws.client.host if ws.client else "unknown"
+
+    if not _global_rate_limiter.is_allowed("__global__"):
+        await ws.accept()
+        await ws.send_json({
+            "type": "error",
+            "message": "Server is busy. Please try again later.",
+        })
+        await ws.close(code=1008, reason="Global rate limit exceeded")
+        print(f"[Global rate limit] Rejected connection from {client_ip}")
+        return
 
     if not _analysis_rate_limiter.is_allowed(client_ip):
         await ws.accept()
@@ -476,8 +584,11 @@ async def _run_session(ws: WebSocket, state: SessionState):
                 "Target circuit (what the student is trying to build):\n"
                 f"{compact}\n"
                 "Remember: The student's actual wiring may have errors — your job is to catch them.\n"
-                "ONLY call probe() when the student literally says the word 'probe'. "
-                "Do NOT call it for theoretical questions about voltages or currents.\n"
+                "CRITICAL PROBE RULE: You MUST call probe() EVERY TIME the student says "
+                "the word 'probe', even if previous calls returned null. Never skip a "
+                "probe call. Never substitute a verbal response for a probe call. "
+                "Null readings are normal and temporary — always try again when asked.\n"
+                "Do NOT call probe() for theoretical questions about voltages or currents.\n"
                 "When the student sends an image: (1) identify what it is, (2) if it is a "
                 "circuit, describe the physical wiring independently WITHOUT referencing "
                 "the target, (3) only then compare against the target node by node and "
@@ -514,7 +625,10 @@ async def _run_session(ws: WebSocket, state: SessionState):
                             state.image_count += 1
                             image_data = base64.b64decode(raw["data"])
                             mime_type = raw.get("mime_type", "image/jpeg")
-                            await process_image(session, state, ws, image_data, mime_type)
+                            task = asyncio.create_task(
+                                process_image(session, state, ws, image_data, mime_type)
+                            )
+                            task.add_done_callback(_log_task_exception)
 
                         elif msg_type == "probe_result":
                             state.probe_result = raw["data"]
@@ -530,6 +644,7 @@ async def _run_session(ws: WebSocket, state: SessionState):
 
                             # Handle tool calls from Gemini
                             if response.tool_call:
+                                state.turn_produced_content = True
                                 print("\n[Tool call received]")
                                 function_responses = []
                                 for fc in response.tool_call.function_calls:
@@ -539,21 +654,30 @@ async def _run_session(ws: WebSocket, state: SessionState):
                                         state.probe_event.clear()
                                         await ws.send_json({"type": "probe_request"})
 
+                                        PROBE_TIMEOUT = 10  # seconds
+
                                         probe_task = asyncio.create_task(state.probe_event.wait())
                                         dc_task = asyncio.create_task(state.disconnected.wait())
-                                        done, pending = await asyncio.wait(
-                                            [probe_task, dc_task],
-                                            return_when=asyncio.FIRST_COMPLETED,
-                                        )
-                                        for t in pending:
-                                            t.cancel()
+                                        try:
+                                            done, pending = await asyncio.wait(
+                                                [probe_task, dc_task],
+                                                timeout=PROBE_TIMEOUT,
+                                                return_when=asyncio.FIRST_COMPLETED,
+                                            )
+                                        finally:
+                                            probe_task.cancel()
+                                            dc_task.cancel()
 
                                         if state.disconnected.is_set():
                                             print("\n[Client disconnected while waiting for probe result]")
                                             return
 
-                                        result = state.probe_result
-                                        print(f"  ← probe() returned: {result}")
+                                        if state.probe_event.is_set():
+                                            result = state.probe_result
+                                            print(f"  ← probe() returned: {result}")
+                                        else:
+                                            result = {"error": "Probe timed out — no response from device"}
+                                            print(f"  ← probe() timed out after {PROBE_TIMEOUT}s")
                                     else:
                                         result = {"error": f"Unknown function: {fc.name}"}
 
@@ -579,15 +703,47 @@ async def _run_session(ws: WebSocket, state: SessionState):
                                     print("\n[Server: Interrupted]")
                                     state.is_playing = False
                                     state.interrupt_requested = False
+                                    state.turn_was_interrupted = True
 
                                 if server_content.turn_complete:
-                                    print("\n[Server: Turn complete]")
+                                    if (
+                                        not state.turn_produced_content
+                                        and not state.turn_was_interrupted
+                                    ):
+                                        state.consecutive_empty_turns += 1
+                                        print(
+                                            f"\n[Server: Empty turn "
+                                            f"({state.consecutive_empty_turns} consecutive)]"
+                                        )
+                                        if state.consecutive_empty_turns >= 2:
+                                            nudge = [
+                                                types.Content(
+                                                    role="user",
+                                                    parts=[types.Part(text=(
+                                                        "[SYSTEM: The student is waiting for "
+                                                        "your response. Please respond to what "
+                                                        "they just said. If they said 'probe', "
+                                                        "you MUST call the probe() function.]"
+                                                    ))],
+                                                ),
+                                            ]
+                                            await session.send_client_content(
+                                                turns=nudge, turn_complete=True
+                                            )
+                                            state.consecutive_empty_turns = 0
+                                            print("[Nudge sent to Gemini]")
+                                    else:
+                                        state.consecutive_empty_turns = 0
+                                        print("\n[Server: Turn complete]")
                                     state.is_playing = False
                                     state.interrupt_requested = False
+                                    state.turn_produced_content = False
+                                    state.turn_was_interrupted = False
 
                                 if server_content.output_transcription:
                                     text = server_content.output_transcription.text
                                     if text:
+                                        state.turn_produced_content = True
                                         print(f"{text}", end="", flush=True)
                                         await ws.send_json(
                                             {"type": "transcript_output", "text": text}
@@ -610,6 +766,7 @@ async def _run_session(ws: WebSocket, state: SessionState):
                                         if part.inline_data:
                                             if state.interrupt_requested:
                                                 continue
+                                            state.turn_produced_content = True
                                             state.is_playing = True
                                             state.speaker_rms = (
                                                 compute_rms(part.inline_data.data) * 0.5
@@ -683,4 +840,12 @@ if __name__ == "__main__":
     )
     print(f"Registered tool: probe()")
     print("Waiting for client connection on ws://0.0.0.0:8000/ws ...\n")
-    uvicorn.run(app, host="0.0.0.0", port=8000, ws_max_size=10 * 1024 * 1024)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        ws_max_size=10 * 1024 * 1024,
+        ws_ping_interval=30,
+        ws_ping_timeout=120,
+    )

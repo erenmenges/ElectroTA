@@ -1,0 +1,9 @@
+python-dotenv
+google-genai
+websockets
+fastapi
+uvicorn
+Pillow
+numpy
+scipy
+opencv-python

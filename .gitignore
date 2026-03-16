@@ -9,3 +9,8 @@
 **/.env
 live_agent.py
 */.vscode/
+.cursor/
+.env
+.python-version
+Python_Script_Image.py
+**/__pycache__/

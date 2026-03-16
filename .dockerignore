@@ -1,0 +1,17 @@
+.env
+.DS_Store
+__pycache__
+*.pyc
+*.pyo
+local_client.py
+requirements_client.txt
+ESP32_Firmware/
+breadboard_analysis/__pycache__/
+crops/
+raw_resistor/
+nuclear_option/
+misc images/
+resistor temps/
+*.jpg
+*.png
+*.jpeg

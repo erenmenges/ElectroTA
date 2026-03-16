@@ -16,7 +16,7 @@ void setup() {
   pinMode(Button, INPUT_PULLDOWN); 
   pinMode(Probe, INPUT); 
 
-  Serial.begin(921600);
+  Serial.begin(115200);
   delay(1000);
   Serial.println(F("ARDUCAM CHECKS"));
 
