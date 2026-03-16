@@ -63,6 +63,16 @@ A FastAPI WebSocket server that orchestrates everything:
 | `breadboard_detection.py` | Detects breadboard row/column structure and maps component pins to rows. |
 | `complete_analysis.py` | Orchestrates all of the above, then sends all crop images and JSON feature files to `gemini-3-flash-preview` (thinking level: medium) for a final spatial analysis of the student's wiring. |
 
+#### Component Segmentation & Analysis
+![Component Segmentation](images/segmented_output.png)
+*Gemini-powered component segmentation and labeling.*
+
+![Resistor Band Analysis](images/cv_resistor.png)
+*Classical CV pipeline for resistor color band direction detection.*
+
+![Breadboard Grid Detection](images/breadboard_debug_grid.png)
+*Mapping component pins to physical breadboard rows and columns.*
+
 ---
 
 ## Installation
